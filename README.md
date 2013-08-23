@@ -33,7 +33,7 @@ Example:
 
 -----------
 
-Requiremnets
+Requirements:
 -----------
 * base linux image for x86_64 arch (I use http://buildroot.uclibc.org/ to create my base and it's 1.4MB in size)
 * rsync
