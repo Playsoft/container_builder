@@ -1,0 +1,255 @@
+#!/bin/bash
+
+#======================================
+# Author: Michal Gryko AT playsoft.fr
+# Created and tested on Ubuntu 13.4
+#======================================
+#======================================
+# some basic functions
+# check: http://www.fizerkhan.com/blog/posts/What-I-learned-from-other-s-shell-scripts.html
+#======================================
+
+NORMAL=$(tput sgr0)
+GREEN=$(tput setaf 2; tput bold)
+YELLOW=$(tput setaf 3)
+RED=$(tput setaf 1)
+
+function red() {
+        echo -e "$RED$*$NORMAL"
+}
+
+function green() {
+        echo -e "$GREEN$*$NORMAL"
+}
+
+function yellow() {
+        echo -e "$YELLOW$*$NORMAL"
+}
+
+function verbose() {
+        if [[ $_verbose ]]
+        then
+            yellow "$*"
+        fi
+}
+
+#======================================
+# display help
+#======================================
+
+function show_help() {
+    cat << EOF
+
+    Usage: $0 -f <path> [-h?vR] [-B <path>] [-o <path>] [-t <path>]
+
+    Arguments:
+        -h -?       - Show this help. And exit.
+        -v          - Be more verbose.
+        -B <path>   - Base image tarball location. Defaults to <script_dir>/rootfs.tar
+        -f <path>   - Input file path. Imput file contain files and/or dirs to add into base image.
+        -o <path>   - Output image tarball file name. Defaults to <scriptdir>/build-image.tar
+        -t <path>   - Temporary working dir. Defaults to /tmp/container_builder/
+        -R          - Do not remove temporary working dir after finish (speedups next build).
+EOF
+}
+
+#======================================
+# parse options
+#======================================
+
+if [ "$#" -eq 0 ]
+    then
+        show_help
+        exit 0
+else
+    OPTIND=1
+    _keep_tmp_workdir=0
+    while getopts "h?vB:f:o:t:R" opt; do
+     case "$opt" in
+     h|\?)
+        show_help
+        exit 0
+        ;;
+     v)  _verbose=1
+        ;;
+     B)  _base_img_tar="$OPTARG"
+        ;;
+     f)  _input_file="$OPTARG"
+        ;;
+     o)  _output_img_tar="$OPTARG"
+        ;;
+     t)  _tmp_workdir="$OPTARG"
+        ;;
+     R)  _keep_tmp_workdir=1
+     esac
+    done
+
+    shift $((OPTIND-1))
+    [ "$1" = "--" ] && shift
+
+    ## defaults
+    _scriptpath=`dirname $0`
+    _base_img_tar=${_base_img_tar:-$_scriptpath/rootfs.tar}
+    _output_img_tar=${_output_img_tar:-$_scriptpath/build-image.tar}
+    _tmp_workdir=${_tmp_workdir:-/tmp/container_builder}
+    _rsync_path=`type -p rsync`
+
+fi
+
+#======================================
+# check args
+#======================================
+
+if [ ! -e "$_input_file" ]
+    then
+    red "\n    ERROR: -f required to be valid filepath"
+    show_help
+    exit 0
+fi
+
+if [ ! -e "$_base_img_tar" ]
+    then
+    red "\n    ERROR: Put rootfs.tar into '$_scriptpath/' or use -B"
+    show_help
+    exit 0
+fi
+
+if [ "$_tmp_workdir" = "/" ]
+    then
+    red "\n Using / as temporary working dir is very bad idea"
+    show_help
+    exit 0
+fi
+
+if [ ! -x "$_rsync_path" ]
+    then
+    red "\n Script uses rsync, please install it first or put it in your PATH." 
+    show_help
+    exit 0
+fi
+
+mkdir -p ${_tmp_workdir}/image
+
+verbose "Startup args:"
+verbose "\tBase image tarball:\t$_base_img_tar"
+verbose "\tAdd files from:\t\t$_input_file"
+verbose "\tOutput image:\t\t$_output_img_tar"
+verbose "\tTemp workdir:\t\t$_tmp_workdir"
+verbose "\tRsync path:\t\t$_rsync_path"
+
+#======================================
+# functions
+#======================================
+
+function add_to_list(){
+    verbose "Adding $1"
+    let _FILES_TO_COPY["$1"]=1
+}
+
+function print_files_to_copy(){
+#dev debug only function
+    red "----> Printing found files"
+    for f in "${!_FILES_TO_COPY[@]}"
+    do
+        echo "$f"
+    done
+    red "<---- print done"
+}
+
+function detect_type(){
+    _type=`stat --format='%F' "$1"`
+    echo $_type
+}
+
+function process_entry(){
+    if [ ${_FILES_TO_COPY["$1"]+aaa} ]
+        then
+        verbose "File already on list, skipping..."
+    else 
+        file_type=$(detect_type "$1")
+        verbose "$1 -> $file_type"
+        case "$file_type" in
+        'regular file'|'regular empty file')
+            process_file "$1"
+            ;;
+        'directory')
+            process_dir "$1"
+            ;;
+        'symbolic link')
+            process_link "$1"
+            ;;
+        esac
+    fi
+}
+
+function process_dir(){
+    add_to_list "$1"
+    while read dir
+    do
+        process_entry $dir 
+    done < <(find "$1" -mindepth 1 -print)
+}
+
+function process_link(){
+    add_to_list "$1"
+    link_path=$(ls -1l "$1" | awk '{sub(/.*-> /,"")}{print}')
+    if [ ! -e "$link_path" ]
+        then
+            #try in same dir as link
+            link_path=$(find "$1" -printf '%h/%l\n')
+            verbose "2nd try link path: $link_path"
+            if [ ! -e "$link_path" ]
+                then
+                    red "Problem with $1 link reference. Need to resolve manually"
+                else
+                    process_entry "$link_path"
+            fi
+        else
+            process_entry "$link_path"
+    fi
+}
+
+function process_file(){
+    add_to_list "$1"
+    while read _ldd
+    do
+        process_entry $_ldd
+    done < <(ldd -v "$1" | awk '{sub(/\(0x[0-9a-z]*\)$/,"")} (/=>/) {if (data[$NF]++ == 0 && $NF !="=>") print $NF }')
+}
+
+#======================================
+# main
+#======================================
+declare -A _FILES_TO_COPY=()
+
+echo "Checking files to copy"
+while read file
+    do
+        process_entry "$file"
+done <  <(cat $_input_file)
+
+verbose "Creating tmp file list: $_tmp_workdir/builder_file_list"
+:> ${_tmp_workdir}/builder_file_list
+for f in "${!_FILES_TO_COPY[@]}"
+    do
+    echo "$f" >> ${_tmp_workdir}/builder_file_list
+done
+
+echo "File copy"
+$_rsync_path -aq --delete --force --files-from=${_tmp_workdir}/builder_file_list / ${_tmp_workdir}/image
+
+echo "Create image tarball + changes required by docker"
+mkdir -p ${_tmp_workdir}/image/etc/
+mkdir -p ${_tmp_workdir}/image/sbin/
+touch ${_tmp_workdir}/image/etc/resolv.conf
+touch ${_tmp_workdir}/image/sbin/init
+cp $_base_img_tar $_output_img_tar
+tar -rf $_output_img_tar -C ${_tmp_workdir}/image .
+
+if [ "$_keep_tmp_workdir" -ne 1 ]
+    then
+        echo "Clean up tmp copy"
+        rm -r ${_tmp_workdir}
+fi
+green "All done, check $_output_img_tar"
+#======================================
